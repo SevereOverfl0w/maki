@@ -160,8 +160,25 @@ impl FloatManager {
         }
     }
 
+    /// The windows this frame lays out. A hidden window is not one of them,
+    /// whatever kind it is: it reserves no cells, paints nothing, and so
+    /// claims no keys, because `on_screen` clears at the end of a frame that
+    /// did not paint it.
+    ///
+    /// Command draining, ticking and event delivery never come through here:
+    /// a hidden window still receives commands and still reports its events,
+    /// so a plugin can go on working on one nobody can see.
+    ///
+    /// The one place `visible` decides anything about layout. Consulting it
+    /// per pass is what let a hidden split reserve cells and paint.
+    fn laid_out(&self) -> impl Iterator<Item = (usize, &FloatWindow)> {
+        self.windows.iter().enumerate().filter(|(_, w)| w.visible)
+    }
+
     fn split_window_idx(&self, dir: Split) -> Option<usize> {
-        self.windows.iter().position(|w| w.config.split == dir)
+        self.laid_out()
+            .find(|(_, w)| w.config.split == dir)
+            .map(|(i, _)| i)
     }
 
     /// The one path windows take to leave the manager. Routing every removal
@@ -316,6 +333,11 @@ impl FloatManager {
         Cadence::when(self.is_open(), Cadence::SPINNER)
     }
 
+    /// Whether a window on screen is waiting on the user.
+    ///
+    /// Reads `visible` on its own rather than through [`Self::laid_out`]: this
+    /// is not a layout question, and a notification for a window nobody can
+    /// see would be one the user cannot answer.
     pub fn needs_input(&self) -> bool {
         self.windows
             .iter()
@@ -385,7 +407,7 @@ impl FloatManager {
     }
 
     /// A stacked window sits below (or above, for the south anchors and a
-    /// caret the host placed above) every stacked window opened before it in
+    /// caret the host placed above) every stacked window laid out before it in
     /// the same corner, so its offset can only be known here, where the whole
     /// list is in scope. Recomputing it each frame is what makes survivors
     /// close the hole left by a window that went away, with nothing to keep
@@ -396,45 +418,35 @@ impl FloatManager {
     /// request would leave a gap as tall as the rows that were cut.
     fn stack_offset(&self, idx: usize, area: Rect, caret: Option<Position>) -> u16 {
         let win = &self.windows[idx];
-        if !Self::stacks(win) {
+        if !stacks(win) {
             return 0;
         }
-        self.windows
-            .iter()
-            .filter(|w| Self::stacks(w) && w.config.anchor == win.config.anchor && w.id < win.id)
+        self.laid_out()
+            .map(|(_, w)| w)
+            .filter(|w| stacks(w) && w.config.anchor == win.config.anchor && w.id < win.id)
             .fold(0, |acc, w| {
                 acc.saturating_add(effective_height(&w.config, area, caret))
                     .saturating_add(STACK_GAP)
             })
     }
 
-    /// A hidden float is not painted, so it takes no stack room either and the
-    /// windows behind it close the gap the way they do when one goes away for
-    /// good. Leaving it in the sum would hold a slot nobody can see open.
-    fn stacks(win: &FloatWindow) -> bool {
-        win.visible && win.config.stack && win.config.split == Split::None
-    }
-
     /// {caret} is the cell the frame being painted put the chat input caret
     /// on, so an [`Anchor::InputCaret`] window follows it through wraps and
     /// resizes with nobody re-placing it.
-    ///
-    /// A hidden float is skipped whole: `visible` is the plugin's switch for
-    /// being on screen at all, so hiding one takes it off the screen and its
-    /// claims with it, instead of leaving a popup drawn with a footer whose
-    /// keys fall through to the chat input.
     ///
     /// The last float pass of the frame, so it is also where the frame's
     /// painting is settled: the splits and panels drawn earlier have already
     /// marked themselves, and what every window did this frame becomes what it
     /// did on the last one, which is what a claim is weighed against.
     pub fn view(&mut self, frame: &mut Frame, area: Rect, caret: Option<Position>) -> Rect {
+        let floats: Vec<usize> = self
+            .laid_out()
+            .filter(|(_, w)| w.config.split == Split::None)
+            .map(|(i, _)| i)
+            .collect();
         let mut union = Rect::default();
 
-        for idx in 0..self.windows.len() {
-            if self.windows[idx].config.split != Split::None || !self.windows[idx].visible {
-                continue;
-            }
+        for idx in floats {
             let popup = resolve_rect(
                 &self.windows[idx].config,
                 area,
@@ -455,12 +467,11 @@ impl FloatManager {
         union
     }
 
-    /// Turns each open split's requested Dimension into a cell count. `carve`
-    /// then clamps that against the chat minimum.
+    /// Turns each split this frame lays out into a cell count. `carve` then
+    /// clamps that against the chat minimum.
     pub fn split_reqs(&self, area: Rect) -> Vec<SplitReq> {
-        self.windows
-            .iter()
-            .filter_map(|w| {
+        self.laid_out()
+            .filter_map(|(_, w)| {
                 let split = w.config.split;
                 let edge = split.edge()?;
                 let extent = match edge.axis {
@@ -487,10 +498,8 @@ impl FloatManager {
 
     pub fn panel_reqs(&self) -> Vec<(usize, u16)> {
         let mut reqs: Vec<(usize, u16)> = self
-            .windows
-            .iter()
-            .enumerate()
-            .filter(|(_, w)| w.config.split == Split::Panel && w.visible)
+            .laid_out()
+            .filter(|(_, w)| w.config.split == Split::Panel)
             .map(|(i, w)| (i, w.config.height.resolve(100)))
             .collect();
         reqs.sort_by_key(|(i, _)| self.windows[*i].config.order);
@@ -670,6 +679,13 @@ impl FloatManager {
 fn send_key(win: &FloatWindow, key: Key) -> bool {
     let _ = win.event_tx.try_send(WinEvent::Key { key });
     true
+}
+
+/// Whether {win} asked for corner stacking. Whether it is on screen at all is
+/// [`FloatManager::laid_out`]'s answer, and `stack_offset` sums only windows
+/// that passed it, so a hidden float holds no slot open.
+fn stacks(win: &FloatWindow) -> bool {
+    win.config.stack && win.config.split == Split::None
 }
 
 fn hint_footer<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<'static> {
@@ -1339,13 +1355,17 @@ mod tests {
 
     /// Rows the windows would be painted at this frame, keyed by id so the
     /// zindex sort of `windows` cannot make the expectations drift.
+    /// The row each window this frame lays out lands on. A hidden one is not
+    /// laid out and so has no row, which is the answer being asserted.
     fn rows_by_id(mgr: &FloatManager) -> Vec<(u32, u16)> {
-        let mut rows: Vec<(u32, u16)> = (0..mgr.windows.len())
-            .map(|idx| {
-                let win = &mgr.windows[idx];
+        let laid_out: Vec<(usize, u32)> = mgr.laid_out().map(|(i, w)| (i, w.id)).collect();
+        let mut rows: Vec<(u32, u16)> = laid_out
+            .into_iter()
+            .map(|(idx, id)| {
                 let offset = mgr.stack_offset(idx, STACK_AREA, NO_CARET);
+                let win = &mgr.windows[idx];
                 (
-                    win.id,
+                    id,
                     resolve_rect(&win.config, STACK_AREA, offset, NO_CARET).y,
                 )
             })
@@ -1388,7 +1408,7 @@ mod tests {
     fn a_hidden_stacked_float_gives_up_its_slot() {
         let mut mgr = FloatManager::new();
         let first = open_float(&mut mgr, stack_config(Anchor::NE, true));
-        let hidden = open_float(
+        open_float(
             &mut mgr,
             FloatConfig {
                 visible: false,
@@ -1399,7 +1419,7 @@ mod tests {
 
         assert_eq!(
             rows_by_id(&mgr),
-            vec![(first, 1), (hidden, 1), (last, 6)],
+            vec![(first, 1), (last, 6)],
             "{EXPECT_STACK_CLOSES_GAP}",
         );
     }
@@ -2819,6 +2839,141 @@ mod tests {
             event_rx.drain().any(|e| matches!(e, WinEvent::Close)),
             "{EXPECT_CLOSE_TO_SPLIT}",
         );
+    }
+
+    const EXPECT_NO_CELLS: &str = "a hidden window must reserve no cells";
+    const EXPECT_NO_PAINT: &str = "a hidden window must paint nothing";
+    const EXPECT_NO_CLAIM: &str = "a hidden window must claim no keys";
+    const HIDDEN_EXTENT: u16 = 6;
+
+    /// One frame the way the app draws it, splits carved first, then panels,
+    /// then floats. Answers the cells the windows reserved outside the chat.
+    fn draw_one_frame(mgr: &mut FloatManager, area: Rect) -> u16 {
+        let splits = crate::components::split_layout::carve(area, &mgr.split_reqs(area));
+        let panels = mgr.panel_reqs();
+        let split_cells: u16 = Split::ALL
+            .iter()
+            .filter_map(|dir| splits.rect(*dir))
+            .map(|r| r.width * r.height)
+            .sum();
+        let panel_cells: u16 = panels.iter().map(|(_, h)| h * area.width).sum();
+
+        render_into(mgr, area, |m, f| {
+            for dir in Split::ALL {
+                if let Some(rect) = splits.rect(dir) {
+                    m.view_split(f, dir, rect);
+                }
+            }
+            let mut y = splits.inner.y;
+            for (idx, h) in panels {
+                m.view_panel(f, idx, Rect::new(splits.inner.x, y, splits.inner.width, h));
+                y += h;
+            }
+            m.view(f, splits.inner, NO_CARET);
+        });
+
+        split_cells + panel_cells
+    }
+
+    /// A hidden window is out of the layout whatever kind it is: no cells
+    /// reserved, nothing painted, and so no claim, because a claim is armed by
+    /// the frame that painted the window. A new window kind is covered by
+    /// adding a row.
+    #[test_case(Split::None ; "float")]
+    #[test_case(Split::Above ; "split_above")]
+    #[test_case(Split::Below ; "split_below")]
+    #[test_case(Split::Left ; "split_left")]
+    #[test_case(Split::Right ; "split_right")]
+    #[test_case(Split::Panel ; "panel")]
+    fn a_hidden_window_of_any_kind_is_out_of_the_layout(split: Split) {
+        let area = Rect::new(0, 0, 80, 40);
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, events, cmd_tx) = make_channels();
+        let config = FloatConfig {
+            width: Dimension::Abs(HIDDEN_EXTENT),
+            height: Dimension::Abs(HIDDEN_EXTENT),
+            border: Border::None,
+            split,
+            visible: false,
+            keys: vec![key("<Tab>")],
+            ..FloatConfig::default()
+        };
+        mgr.open(make_buf(&["x"]), config, false, event_tx, cmd_rx);
+
+        assert_eq!(draw_one_frame(&mut mgr, area), 0, "{EXPECT_NO_CELLS}");
+        assert!(!mgr.windows[0].on_screen, "{EXPECT_NO_PAINT}");
+        assert!(!mgr.handle_claimed_key(key("<Tab>")), "{EXPECT_NO_CLAIM}");
+        assert!(!took_a_key(&events), "{EXPECT_NO_CLAIM}");
+
+        cmd_tx.send(WinCommand::SetVisible(true)).unwrap();
+        let _ = mgr.tick();
+
+        let cells = draw_one_frame(&mut mgr, area);
+        assert_eq!(
+            cells > 0,
+            split != Split::None,
+            "showing it gives back the cells its kind reserves, and a float reserves none"
+        );
+        assert!(mgr.windows[0].on_screen, "showing it paints it again");
+        assert!(
+            mgr.handle_claimed_key(key("<Tab>")),
+            "and its claim is back"
+        );
+        assert!(took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
+    }
+
+    /// Panels are the one kind that shares an edge, so a hidden one has to
+    /// leave its rows to the panel beside it rather than hold them empty.
+    #[test]
+    fn a_hidden_panel_leaves_its_rows_to_the_one_beside_it() {
+        let area = Rect::new(0, 0, 80, 40);
+        let mut mgr = FloatManager::new();
+        let panel = |visible: bool| FloatConfig {
+            split: Split::Panel,
+            height: Dimension::Abs(HIDDEN_EXTENT),
+            border: Border::None,
+            visible,
+            ..FloatConfig::default()
+        };
+        let (hidden_tx, hidden_rx, hidden_events, _) = make_channels();
+        mgr.open(
+            make_buf(&["hidden"]),
+            panel(false),
+            false,
+            hidden_tx,
+            hidden_rx,
+        );
+        let (shown_tx, shown_rx, shown_events, _) = make_channels();
+        mgr.open(make_buf(&["shown"]), panel(true), false, shown_tx, shown_rx);
+
+        assert_eq!(
+            mgr.panel_reqs().len(),
+            1,
+            "only the panel on screen asks for rows"
+        );
+
+        draw_one_frame(&mut mgr, area);
+        assert!(
+            shown_events
+                .drain()
+                .any(|e| matches!(e, WinEvent::Resize { .. })),
+            "the visible panel paints"
+        );
+        assert!(
+            !hidden_events
+                .drain()
+                .any(|e| matches!(e, WinEvent::Resize { .. })),
+            "{EXPECT_NO_PAINT}"
+        );
+    }
+
+    /// With nothing asking for an edge the chat keeps the whole area, which is
+    /// what a hidden split must leave behind.
+    #[test]
+    fn carve_with_no_reqs_leaves_the_chat_whole() {
+        let area = Rect::new(0, 0, 80, 40);
+        let layout = crate::components::split_layout::carve(area, &[]);
+        assert_eq!(layout.inner, area);
     }
 
     #[test]
