@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
-use crossterm::event::KeyEvent;
 use maki_agent::{SharedBuf, SnapshotLine, SpanStyle};
-use maki_lua::{Anchor, Axis, Border, FloatConfig, Split, TitlePos, WinCommand, WinEvent};
+use maki_lua::{Anchor, Axis, Border, FloatConfig, Key, Split, TitlePos, WinCommand, WinEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
@@ -12,7 +11,6 @@ use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::split_layout::SplitReq;
 use crate::components::{
     Overlay,
-    keybindings::key_event_to_string,
     scrollbar::render_vertical_scrollbar,
     tool_display::{SPINNER_STYLE_NAME, SPINNER_STYLE_PREFIX, resolve_span_style},
 };
@@ -326,14 +324,14 @@ impl FloatManager {
 
     /// The focused window is handed every key, ahead of every overlay the host
     /// owns: it is the thing the user is looking at and typing into.
-    pub fn handle_focused_key(&self, key_event: KeyEvent) -> bool {
+    pub fn handle_focused_key(&self, key: Key) -> bool {
         let Some(win) = self
             .focused_id
             .and_then(|fid| self.windows.iter().find(|w| w.id == fid))
         else {
             return false;
         };
-        send_key(win, key_event)
+        send_key(win, key)
     }
 
     /// The keys an unfocused window declared at open, which it takes only
@@ -345,14 +343,14 @@ impl FloatManager {
     /// Nothing has to be released. The claim list lives on the window, so it
     /// goes when the window does, through the one removal path, and a list can
     /// never outlive what the user can see.
-    pub fn handle_claimed_key(&mut self, key_event: KeyEvent) -> bool {
+    pub fn handle_claimed_key(&mut self, key: Key) -> bool {
         // The frame this key was pressed in repaints whatever this drops, so
         // the debt is already owed and there is nothing to report.
         let _ = self.drain_commands();
-        let Some(win) = self.claimant(key_event) else {
+        let Some(win) = self.claimant(key) else {
             return false;
         };
-        send_key(win, key_event)
+        send_key(win, key)
     }
 
     /// The topmost window on screen claiming {key}. `windows` is sorted by
@@ -366,11 +364,11 @@ impl FloatManager {
     /// hold keys for the rest of the run while drawing no footer to say so, and
     /// unlike a `maki.keymap.set` binding a claim appears in no list the user
     /// can read.
-    fn claimant(&self, key: KeyEvent) -> Option<&FloatWindow> {
+    fn claimant(&self, key: Key) -> Option<&FloatWindow> {
         self.windows
             .iter()
             .rev()
-            .find(|w| w.on_screen && w.config.keys.contains(&(key.code, key.modifiers)))
+            .find(|w| w.on_screen && w.config.keys.contains(&key))
     }
 
     pub fn handle_paste(&self, text: &str) -> bool {
@@ -666,15 +664,11 @@ impl FloatManager {
     }
 }
 
-/// Hands {key_event} to {win} and reports the key spent. A key with no
-/// spelling is spent all the same: the window it was routed to is the thing
-/// the user is aiming at, and passing it on would run a built-in binding
-/// behind a modal float.
-fn send_key(win: &FloatWindow, key_event: KeyEvent) -> bool {
-    let key = key_event_to_string(&key_event);
-    if !key.is_empty() {
-        let _ = win.event_tx.try_send(WinEvent::Key { key });
-    }
+/// Hands {key} to {win} and reports it spent. Only a nameable key gets this
+/// far: [`Key::from_event`] settles that at the boundary, so an unnameable
+/// press falls through to the host instead of being eaten by a focused float.
+fn send_key(win: &FloatWindow, key: Key) -> bool {
+    let _ = win.event_tx.try_send(WinEvent::Key { key });
     true
 }
 
@@ -906,7 +900,7 @@ impl Overlay for FloatManager {
 mod tests {
     use super::*;
     use crate::repaint::expect::{OWED, QUIET};
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use maki_agent::SnapshotSpan;
     use maki_lua::{Dimension, FloatConfigPatch};
     use test_case::test_case;
@@ -926,6 +920,7 @@ mod tests {
     const EXPECT_NOT_MODAL: &str = "expected a focused split to not be modal";
     const NO_STACK_OFFSET: u16 = 0;
     const NO_CARET: Option<Position> = None;
+    const EXPECT_NAMEABLE: &str = "the test named a key no notation spells";
 
     fn make_line(text: &str) -> SnapshotLine {
         SnapshotLine {
@@ -1602,11 +1597,7 @@ mod tests {
         let mut mgr = FloatManager::new();
         let (event_rx, _cmd_tx) = open_with_lines(&mut mgr, &["line1"]);
 
-        let key_event = KeyEvent::new(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
-        );
-        let handled = mgr.handle_focused_key(key_event);
+        let handled = mgr.handle_focused_key(key("a"));
         assert!(handled, "true when a window has focus");
 
         let evt = event_rx.drain().find(|e| matches!(e, WinEvent::Key { .. }));
@@ -1616,16 +1607,12 @@ mod tests {
     #[test]
     fn handle_key_returns_false_when_empty() {
         let mut mgr = FloatManager::new();
-        let key_event = KeyEvent::new(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
-        );
         assert!(
-            !mgr.handle_focused_key(key_event),
+            !mgr.handle_focused_key(key("a")),
             "handle_focused_key should return false with no windows"
         );
         assert!(
-            !mgr.handle_claimed_key(key_event),
+            !mgr.handle_claimed_key(key("a")),
             "handle_claimed_key should return false with no windows"
         );
     }
@@ -1642,15 +1629,15 @@ mod tests {
     /// An unfocused window that declared {claims}, as the completion popup
     /// opens one: the user goes on typing into the chat input under it. The
     /// command end comes back because dropping it closes the window.
-    fn open_claiming(
-        mgr: &mut FloatManager,
-        claims: &[(KeyCode, KeyModifiers)],
-        zindex: u16,
-    ) -> WinChannels {
+    fn key(lhs: &str) -> Key {
+        Key::parse(lhs).expect(EXPECT_NAMEABLE)
+    }
+
+    fn open_claiming(mgr: &mut FloatManager, claims: &[&str], zindex: u16) -> WinChannels {
         let (event_tx, cmd_rx, event_rx, cmd_tx) = make_channels();
         let config = FloatConfig {
             zindex,
-            keys: claims.to_vec(),
+            keys: claims.iter().copied().map(key).collect(),
             ..FloatConfig::default()
         };
         mgr.open(make_buf(&["x"]), config, false, event_tx, cmd_rx);
@@ -1668,9 +1655,9 @@ mod tests {
     #[test]
     fn an_unfocused_window_takes_the_keys_it_claimed() {
         let mut mgr = FloatManager::new();
-        let (events, _cmd_tx) = open_claiming(&mut mgr, &[(KeyCode::Tab, KeyModifiers::NONE)], 50);
+        let (events, _cmd_tx) = open_claiming(&mut mgr, &["<Tab>"], 50);
 
-        assert!(mgr.handle_claimed_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(mgr.handle_claimed_key(key("<Tab>")));
         assert!(took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
     }
 
@@ -1679,9 +1666,9 @@ mod tests {
     #[test]
     fn an_unfocused_window_leaves_every_other_key_alone() {
         let mut mgr = FloatManager::new();
-        let (events, _cmd_tx) = open_claiming(&mut mgr, &[(KeyCode::Tab, KeyModifiers::NONE)], 50);
+        let (events, _cmd_tx) = open_claiming(&mut mgr, &["<Tab>"], 50);
 
-        assert!(!mgr.handle_claimed_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)));
+        assert!(!mgr.handle_claimed_key(key("a")));
         assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
     }
 
@@ -1690,10 +1677,9 @@ mod tests {
     #[test]
     fn a_claim_answers_only_its_own_modifiers() {
         let mut mgr = FloatManager::new();
-        let (events, _cmd_tx) =
-            open_claiming(&mut mgr, &[(KeyCode::Char('n'), KeyModifiers::CONTROL)], 50);
+        let (events, _cmd_tx) = open_claiming(&mut mgr, &["<C-n>"], 50);
 
-        assert!(!mgr.handle_claimed_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)));
+        assert!(!mgr.handle_claimed_key(key("n")));
         assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
     }
 
@@ -1702,10 +1688,10 @@ mod tests {
     #[test]
     fn the_topmost_claiming_window_takes_the_key() {
         let mut mgr = FloatManager::new();
-        let (under, _under_tx) = open_claiming(&mut mgr, &[(KeyCode::Esc, KeyModifiers::NONE)], 10);
-        let (over, _over_tx) = open_claiming(&mut mgr, &[(KeyCode::Esc, KeyModifiers::NONE)], 90);
+        let (under, _under_tx) = open_claiming(&mut mgr, &["<Esc>"], 10);
+        let (over, _over_tx) = open_claiming(&mut mgr, &["<Esc>"], 90);
 
-        assert!(mgr.handle_claimed_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(mgr.handle_claimed_key(key("<Esc>")));
         assert!(took_a_key(&over), "{CLAIM_NOT_DELIVERED}");
         assert!(!took_a_key(&under), "{CLAIM_LEAKED}");
     }
@@ -1717,9 +1703,8 @@ mod tests {
     #[test]
     fn raising_a_window_moves_the_claim_with_it() {
         let mut mgr = FloatManager::new();
-        let (under, under_tx) =
-            open_claiming(&mut mgr, &[(KeyCode::Enter, KeyModifiers::NONE)], 10);
-        let (over, _over_tx) = open_claiming(&mut mgr, &[(KeyCode::Enter, KeyModifiers::NONE)], 90);
+        let (under, under_tx) = open_claiming(&mut mgr, &["<CR>"], 10);
+        let (over, _over_tx) = open_claiming(&mut mgr, &["<CR>"], 90);
 
         under_tx
             .send(WinCommand::SetConfig(FloatConfigPatch {
@@ -1728,7 +1713,7 @@ mod tests {
             }))
             .unwrap();
 
-        assert!(mgr.handle_claimed_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(mgr.handle_claimed_key(key("<CR>")));
         assert!(took_a_key(&under), "{CLAIM_NOT_DELIVERED}");
         assert!(!took_a_key(&over), "{CLAIM_LEAKED}");
     }
@@ -1738,8 +1723,8 @@ mod tests {
     #[test]
     fn levelling_the_zindex_keeps_open_order() {
         let mut mgr = FloatManager::new();
-        let (under, under_tx) = open_claiming(&mut mgr, &[(KeyCode::Tab, KeyModifiers::NONE)], 10);
-        let (over, _over_tx) = open_claiming(&mut mgr, &[(KeyCode::Tab, KeyModifiers::NONE)], 90);
+        let (under, under_tx) = open_claiming(&mut mgr, &["<Tab>"], 10);
+        let (over, _over_tx) = open_claiming(&mut mgr, &["<Tab>"], 90);
 
         under_tx
             .send(WinCommand::SetConfig(FloatConfigPatch {
@@ -1748,9 +1733,48 @@ mod tests {
             }))
             .unwrap();
 
-        assert!(mgr.handle_claimed_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(mgr.handle_claimed_key(key("<Tab>")));
         assert!(took_a_key(&over), "{CLAIM_NOT_DELIVERED}");
         assert!(!took_a_key(&under), "{CLAIM_LEAKED}");
+    }
+
+    /// A terminal that speaks the kitty protocol reports Shift+Tab as
+    /// `Tab + SHIFT` and every other one sends `CSI Z`, i.e. `BackTab`. One
+    /// claim has to answer both, or a popup's binding works on half the
+    /// terminals in the world.
+    #[test_case(KeyCode::Tab, KeyModifiers::SHIFT ; "kitty_reports_tab_with_shift")]
+    #[test_case(KeyCode::BackTab, KeyModifiers::NONE ; "everything_else_sends_csi_z")]
+    fn a_shift_tab_claim_answers_either_way_the_terminal_spells_it(
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) {
+        let mut mgr = FloatManager::new();
+        let (events, _cmd_tx) = open_claiming(&mut mgr, &["<S-Tab>"], 50);
+
+        let pressed = Key::from_event(KeyEvent::new(code, modifiers)).expect(EXPECT_NAMEABLE);
+        assert!(mgr.handle_claimed_key(pressed));
+        assert!(took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
+    }
+
+    /// The window is handed the one spelling `maki.keymap` documents, so a
+    /// plugin comparing against `maki.keys` matches what it claimed.
+    #[test_case("<C-n>" ; "ctrl_letter")]
+    #[test_case("<Space>" ; "space")]
+    #[test_case("<S-Tab>" ; "shift_tab")]
+    #[test_case("a" ; "plain_char")]
+    fn a_delivered_key_carries_its_canonical_notation(lhs: &str) {
+        let mut mgr = FloatManager::new();
+        let (events, _cmd_tx) = open_claiming(&mut mgr, &[lhs], 50);
+
+        assert!(mgr.handle_claimed_key(key(lhs)));
+        let delivered = events
+            .drain()
+            .find_map(|e| match e {
+                WinEvent::Key { key } => Some(key.notation()),
+                _ => None,
+            })
+            .expect(CLAIM_NOT_DELIVERED);
+        assert_eq!(delivered, lhs);
     }
 
     /// What bounds a claim, and the whole reason there is nothing to release:
@@ -1758,11 +1782,11 @@ mod tests {
     #[test]
     fn a_claim_dies_with_the_window() {
         let mut mgr = FloatManager::new();
-        let (events, _cmd_tx) = open_claiming(&mut mgr, &[(KeyCode::Tab, KeyModifiers::NONE)], 50);
+        let (events, _cmd_tx) = open_claiming(&mut mgr, &["<Tab>"], 50);
 
         mgr.close_all();
 
-        assert!(!mgr.handle_claimed_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(!mgr.handle_claimed_key(key("<Tab>")));
         assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
     }
 
@@ -1773,11 +1797,11 @@ mod tests {
     #[test]
     fn a_window_closing_this_instant_claims_nothing() {
         let mut mgr = FloatManager::new();
-        let (events, cmd_tx) = open_claiming(&mut mgr, &[(KeyCode::Enter, KeyModifiers::NONE)], 50);
+        let (events, cmd_tx) = open_claiming(&mut mgr, &["<CR>"], 50);
 
         cmd_tx.send(WinCommand::Close).unwrap();
 
-        assert!(!mgr.handle_claimed_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(!mgr.handle_claimed_key(key("<CR>")));
         assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
         assert!(!mgr.is_open(), "{EXPECT_CLOSED}");
     }
@@ -1790,13 +1814,13 @@ mod tests {
         let (event_tx, cmd_rx, event_rx, _cmd_tx) = make_channels();
         let config = FloatConfig {
             visible: false,
-            keys: vec![(KeyCode::Tab, KeyModifiers::NONE)],
+            keys: vec![key("<Tab>")],
             ..FloatConfig::default()
         };
         mgr.open(make_buf(&["x"]), config, false, event_tx, cmd_rx);
         paint(&mut mgr);
 
-        assert!(!mgr.handle_claimed_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(!mgr.handle_claimed_key(key("<Tab>")));
         assert!(!took_a_key(&event_rx), "{CLAIM_LEAKED}");
     }
 
@@ -1807,7 +1831,7 @@ mod tests {
     #[test]
     fn hiding_a_window_takes_it_off_the_screen_and_out_of_the_claim() {
         let mut mgr = FloatManager::new();
-        let (events, cmd_tx) = open_claiming(&mut mgr, &[(KeyCode::Esc, KeyModifiers::NONE)], 50);
+        let (events, cmd_tx) = open_claiming(&mut mgr, &["<Esc>"], 50);
         assert!(mgr.windows[0].on_screen, "{EXPECT_PAINTED}");
 
         cmd_tx.send(WinCommand::SetVisible(false)).unwrap();
@@ -1822,7 +1846,7 @@ mod tests {
         });
 
         assert!(!mgr.windows[0].on_screen, "{EXPECT_HIDDEN_UNPAINTED}");
-        assert!(!mgr.handle_claimed_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!mgr.handle_claimed_key(key("<Esc>")));
         assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
     }
 
@@ -1837,13 +1861,13 @@ mod tests {
         let config = FloatConfig {
             width: Dimension::Abs(0),
             height: Dimension::Abs(0),
-            keys: vec![(KeyCode::Enter, KeyModifiers::NONE)],
+            keys: vec![key("<CR>")],
             ..FloatConfig::default()
         };
         mgr.open(make_buf(&["x"]), config, false, event_tx, cmd_rx);
         paint(&mut mgr);
 
-        assert!(!mgr.handle_claimed_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(!mgr.handle_claimed_key(key("<CR>")));
         assert!(!took_a_key(&event_rx), "{CLAIM_LEAKED}");
     }
 
@@ -1855,17 +1879,17 @@ mod tests {
         let mut mgr = FloatManager::new();
         let (event_tx, cmd_rx, event_rx, _cmd_tx) = make_channels();
         let config = FloatConfig {
-            keys: vec![(KeyCode::Tab, KeyModifiers::NONE)],
+            keys: vec![key("<Tab>")],
             ..FloatConfig::default()
         };
         mgr.open(make_buf(&["x"]), config, false, event_tx, cmd_rx);
 
-        assert!(!mgr.handle_claimed_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(!mgr.handle_claimed_key(key("<Tab>")));
         assert!(!took_a_key(&event_rx), "{CLAIM_LEAKED}");
 
         paint(&mut mgr);
 
-        assert!(mgr.handle_claimed_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(mgr.handle_claimed_key(key("<Tab>")));
         assert!(took_a_key(&event_rx), "{CLAIM_NOT_DELIVERED}");
     }
 
@@ -2069,11 +2093,7 @@ mod tests {
 
         assert_eq!(mgr.focused_id, Some(1), "latest focused window");
 
-        let key_event = KeyEvent::new(
-            crossterm::event::KeyCode::Char('x'),
-            crossterm::event::KeyModifiers::NONE,
-        );
-        mgr.handle_focused_key(key_event);
+        mgr.handle_focused_key(key("x"));
 
         let win1_keys: Vec<_> = erx1
             .drain()
@@ -2368,12 +2388,8 @@ mod tests {
         cmd_tx.send(WinCommand::Close).unwrap();
         let _ = mgr.tick();
 
-        let key_event = KeyEvent::new(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
-        );
         assert!(
-            !mgr.handle_focused_key(key_event),
+            !mgr.handle_focused_key(key("a")),
             "no windows remain, so handle_focused_key must return false",
         );
     }
@@ -2715,7 +2731,7 @@ mod tests {
     #[test]
     fn a_window_opened_unfocused_is_never_handed_focus() {
         let mut mgr = FloatManager::new();
-        let (events, _cmd_tx) = open_claiming(&mut mgr, &[(KeyCode::Tab, KeyModifiers::NONE)], 50);
+        let (events, _cmd_tx) = open_claiming(&mut mgr, &["<Tab>"], 50);
         let (tx, rx, _erx, _ctx) = make_channels();
         mgr.open(make_buf(&["modal"]), make_config(), true, tx, rx);
         let modal = mgr.windows.last().expect(EXPECT_OPEN).id;
@@ -2723,7 +2739,7 @@ mod tests {
         mgr.remove_windows(|w| w.id == modal);
 
         assert_eq!(mgr.focused_id, None, "{EXPECT_NO_PROMOTION}");
-        assert!(!mgr.handle_focused_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)));
+        assert!(!mgr.handle_focused_key(key("a")));
         assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
     }
 

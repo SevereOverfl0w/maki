@@ -114,6 +114,10 @@ fn load_plugins(
         .collect();
     warnings.extend(host.load_declared_packages(&available, &declared, &config.plugins));
 
+    // Last, so a finding from any of the loads above is carried, and taken
+    // rather than read: a later `/reload` reports only what that load found.
+    warnings.extend(host.take_key_warnings());
+
     Ok((config, sanitize_warnings(&warnings)))
 }
 

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use include_dir::{Dir, File, include_dir};
@@ -18,6 +18,7 @@ use crate::api::util::command::{
     HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction, UiAttachment,
 };
 use crate::error::PluginError;
+use crate::key_lint;
 use crate::pack::DiscoveredPackage;
 use crate::plugin_permissions::{
     MANIFEST_FILE, PluginPermissions, Requested, check_plugin_compatibility,
@@ -34,6 +35,9 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const PACK_STATE_UNAVAILABLE: &str = "could not read package state: plugin host stopped";
 const USER_PLUGIN: &str = "user";
 pub const SKIPPED_PLUGIN_WARNING: &str = "skipping plugin lua";
+/// Prefix on a key spelling finding, naming which of the things maki reports
+/// at startup this one is.
+pub const KEY_WARNING: &str = "key spelling";
 /// Tests assert on this exact text, so a wording tweak here updates them too.
 pub const PERMISSION_NAME_WARNING: &str = "inherits maki's permission rules for the builtin \
      tool of the same name, together with any \"always allow\" you saved";
@@ -256,6 +260,10 @@ pub struct PluginHost {
     inner: LuaThread,
     plugin_rules: Arc<PluginRuleStore>,
     registry: Arc<ToolRegistry>,
+    /// Key spellings [`key_lint`] found while loading, waiting to be shown.
+    /// Collected rather than logged: a plugin whose keys silently stopped
+    /// working is not helped by a line in a file nobody opens.
+    key_warnings: Mutex<Vec<String>>,
 }
 
 impl Drop for PluginHost {
@@ -298,12 +306,23 @@ impl PluginHost {
             inner: lua,
             plugin_rules,
             registry,
+            key_warnings: Mutex::default(),
         })
     }
 
     /// The store that `maki.api.register_permission_rule` writes into. Hand
     /// it to every [`maki_agent::permissions::PermissionManager`] so plugin
     /// rules apply to all sessions.
+    /// The key spellings loading found wrong, emptied as they are taken. The
+    /// caller is expected to put them in front of the user; nothing else
+    /// reports them.
+    pub fn take_key_warnings(&self) -> Vec<String> {
+        self.key_warnings
+            .lock()
+            .map(|mut w| std::mem::take(&mut *w))
+            .unwrap_or_default()
+    }
+
     pub fn plugin_rules(&self) -> Arc<PluginRuleStore> {
         Arc::clone(&self.plugin_rules)
     }
@@ -503,12 +522,24 @@ impl PluginHost {
         Ok(())
     }
 
+    /// The one path every chunk of plugin Lua takes into the runtime, which
+    /// is why the key lint runs here: a spelling check that only covered some
+    /// of the ways a plugin can be loaded would go quiet exactly for the
+    /// hand-written init.lua most likely to hold an old one.
     fn send_load(
         &self,
         name: Arc<str>,
         chunks: Vec<LoadChunk>,
         context: LoadContext,
     ) -> Result<(), PluginError> {
+        if let Ok(mut warnings) = self.key_warnings.lock() {
+            warnings.extend(
+                chunks
+                    .iter()
+                    .flat_map(|chunk| key_lint::lint(&chunk.name, &chunk.source))
+                    .map(|finding| format!("{KEY_WARNING}: {finding}")),
+            );
+        }
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.inner
             .tx
@@ -1271,7 +1302,7 @@ impl EventHandle {
 mod tests {
     use super::*;
     use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
-    use crossterm::event::{KeyCode, KeyEvent};
+    use crossterm::event::KeyCode;
     use maki_agent::prompt::{PromptId, ResolvedSlots, Slot};
     use maki_agent::tools::ToolRegistry;
     use std::time::Instant;
@@ -1546,7 +1577,7 @@ mod tests {
             assert_eq!(snap.entries.len(), 1, "override published to snapshot");
             let entry = &snap.entries[0];
             assert_eq!(entry.desc, "test override");
-            KeyEvent::new(entry.key, entry.modifiers)
+            entry.key
         };
         assert!(
             host.command_reader().load().commands.is_empty(),
@@ -1603,9 +1634,9 @@ mod tests {
             let entry = snap
                 .entries
                 .iter()
-                .find(|e| e.key == KeyCode::Char(code))
+                .find(|e| e.key.code() == KeyCode::Char(code))
                 .expect("both keys published");
-            KeyEvent::new(entry.key, entry.modifiers)
+            entry.key
         };
 
         assert!(reader.dispatch(key_of('g'), |t| handle.run_keybind_callback(t)));

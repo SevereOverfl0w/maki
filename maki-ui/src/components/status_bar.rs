@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::env;
 use std::path::Path;
 use std::sync::Arc;
@@ -65,6 +66,12 @@ pub struct StatusBarContext<'a> {
 
 pub struct StatusBar {
     flash: Option<(String, Instant)>,
+    /// The messages flashed while one was already showing, oldest first. The
+    /// bar has one line, so they are shown in turn rather than at once, and
+    /// none is dropped: startup hands it every warning of the run at once, and
+    /// the one that used to survive was the last, which is the least likely to
+    /// be the one that matters.
+    queued: VecDeque<String>,
     started_at: Instant,
     cwd_branch: String,
     pub flash_duration: Duration,
@@ -75,6 +82,7 @@ impl StatusBar {
     pub fn new(flash_duration: Duration) -> Self {
         Self {
             flash: None,
+            queued: VecDeque::new(),
             started_at: Instant::now(),
             cwd_branch: cwd_branch_label(),
             flash_duration,
@@ -82,7 +90,23 @@ impl StatusBar {
         }
     }
 
+    /// Shows {msg} now, in place of whatever was showing. The answer to
+    /// something the user just did: they are looking at the bar, and a toggle
+    /// reporting the state before last is worse than useless.
     pub fn flash(&mut self, msg: String) {
+        self.flash = Some((msg, Instant::now()));
+    }
+
+    /// Shows {msg} once the line is free, behind anything already waiting.
+    ///
+    /// For a batch nobody asked for and every line of which matters, which is
+    /// startup's warnings: [`Self::flash`] would leave only the last, and the
+    /// last is no likelier than any other to be the one worth reading.
+    pub fn queue_flash(&mut self, msg: String) {
+        if self.flash.is_some() {
+            self.queued.push_back(msg);
+            return;
+        }
         self.flash = Some((msg, Instant::now()));
     }
 
@@ -108,8 +132,12 @@ impl StatusBar {
         Dirty::from(changed)
     }
 
+    /// Dismisses everything waiting, not just what is on screen: this answers
+    /// a user who wants the bar back, and leaving the queue to drain would
+    /// keep taking the line back from them.
     pub fn clear_flash(&mut self) {
         self.flash = None;
+        self.queued.clear();
     }
 
     pub fn clear_expired_hint(&mut self) -> Dirty {
@@ -120,16 +148,20 @@ impl StatusBar {
         {
             return Dirty::NO;
         }
-        self.flash = None;
+        self.flash = self.queued.pop_front().map(|msg| (msg, Instant::now()));
         Dirty::YES
     }
 
     /// The bar spins for a whole turn, again while a restore is in flight, and
     /// it counts a retry down by the second. It sits next to [`Self::view`] so
     /// a new moving span cannot forget to claim its frames.
-    pub fn cadence(status: &Status, restoring: bool, retrying: bool) -> Cadence {
+    ///
+    /// A queue claims frames too, because nothing else owes one: startup fills
+    /// it and then the UI sits idle waiting for the user, and a message whose
+    /// turn never comes is a message nobody reads.
+    pub fn cadence(&self, status: &Status, restoring: bool, retrying: bool) -> Cadence {
         Cadence::when(
-            *status == Status::Streaming || restoring || retrying,
+            *status == Status::Streaming || restoring || retrying || !self.queued.is_empty(),
             Cadence::SPINNER,
         )
     }
@@ -396,6 +428,12 @@ mod tests {
 
     const FLASH_TTL: Duration = Duration::from_secs(3600);
     const FLASH_MSG: &str = "Copied";
+    const EXPECT_FLASH: &str = "a queued message has to reach the bar";
+    const EXPECT_EVERY_MESSAGE: &str = "every flashed message has to be shown, in order";
+    const EXPECT_DRAINS: &str = "the bar has to end up empty";
+    const EXPECT_IDLE: &str = "nothing waiting means no frames to claim";
+    const EXPECT_TICKING: &str = "a waiting message has to claim the frames that advance it";
+    const EXPECT_NEWEST: &str = "a flash answers the user's last action, not an earlier one";
     const STALE_BRANCH: &str = "/nowhere:gone";
     const BAR_WIDTH: u16 = 120;
     const MODEL_ID: &str = "test-model";
@@ -579,6 +617,85 @@ mod tests {
         let first = bar.clear_expired_hint();
         assert_eq!(bar.clear_expired_hint(), Dirty::NO, "{QUIET}");
         first
+    }
+
+    /// A toggle says what just happened, and the user is looking when it
+    /// does. Queuing these would answer the press before last.
+    #[test]
+    fn flashing_replaces_what_is_showing() {
+        let mut bar = StatusBar::new(FLASH_TTL);
+
+        bar.flash("enabled".into());
+        bar.flash("disabled".into());
+
+        assert_eq!(bar.flash_text(), Some("disabled"), "{EXPECT_NEWEST}");
+        assert_eq!(
+            bar.cadence(&Status::Idle, false, false),
+            Cadence::IDLE,
+            "{EXPECT_IDLE}"
+        );
+    }
+
+    /// Startup hands the bar every warning of the run in one go. The bar has
+    /// one line, so they are shown in turn; what must not happen is the
+    /// silent drop of all but the last, which is the least likely to be the
+    /// one worth reading.
+    #[test]
+    fn every_queued_message_gets_its_turn() {
+        let mut bar = StatusBar::new(Duration::ZERO);
+        let msgs = ["first", "second", "third"];
+
+        for msg in msgs {
+            bar.queue_flash((*msg).into());
+        }
+
+        let mut seen = Vec::new();
+        for _ in 0..msgs.len() {
+            seen.push(bar.flash_text().expect(EXPECT_FLASH).to_owned());
+            let _ = bar.clear_expired_hint();
+        }
+
+        assert_eq!(seen, msgs, "{EXPECT_EVERY_MESSAGE}");
+        assert_eq!(bar.flash_text(), None, "{EXPECT_DRAINS}");
+    }
+
+    /// A queue nothing is owed a frame for is a queue that never advances: the
+    /// UI is idle right after startup, which is exactly when it is full.
+    #[test]
+    fn a_queue_claims_frames() {
+        let mut bar = StatusBar::new(FLASH_TTL);
+        bar.queue_flash(FLASH_MSG.into());
+        assert_eq!(
+            bar.cadence(&Status::Idle, false, false),
+            Cadence::IDLE,
+            "{EXPECT_IDLE}"
+        );
+
+        bar.queue_flash(FLASH_MSG.into());
+
+        assert_eq!(
+            bar.cadence(&Status::Idle, false, false),
+            Cadence::SPINNER,
+            "{EXPECT_TICKING}"
+        );
+    }
+
+    /// Dismissing has to mean dismissed: a queue that went on taking the line
+    /// back would read as a bar that ignores the user.
+    #[test]
+    fn clearing_drops_what_is_waiting_too() {
+        let mut bar = StatusBar::new(FLASH_TTL);
+        bar.queue_flash(FLASH_MSG.into());
+        bar.queue_flash(FLASH_MSG.into());
+
+        bar.clear_flash();
+
+        assert_eq!(bar.flash_text(), None, "{EXPECT_DRAINS}");
+        assert_eq!(
+            bar.cadence(&Status::Idle, false, false),
+            Cadence::IDLE,
+            "{EXPECT_IDLE}"
+        );
     }
 
     /// The watcher fires for any write near `.git/HEAD`, most of which leave

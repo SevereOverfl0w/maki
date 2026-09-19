@@ -3257,6 +3257,59 @@ maki.keymap.set("n", "<C-t>", function()
 end, { desc = "Say hello" })
 ```
 
+## Key notation
+
+One notation covers every place maki names a key: the string `set` and
+`del` read, the `keys` a window claims in `maki.ui.open_win`, and the
+`key` field of a `win:recv` keypress event. `normalize` turns any
+accepted spelling into the one maki prints.
+
+A single character stands for itself: `a`, `A`, `7`, `?`. Every other
+key goes in angle brackets, behind its modifier prefixes.
+
+| Key | Notation | Also accepted |
+| --- | --- | --- |
+| Enter | `<CR>` | `<Enter>`, `<Return>` |
+| Escape | `<Esc>` | `<Escape>` |
+| Backspace | `<BS>` | `<Backspace>` |
+| Delete | `<Del>` | `<Delete>` |
+| Tab | `<Tab>` | |
+| Shift+Tab | `<S-Tab>` | |
+| Space | `<Space>` | |
+| Arrows | `<Up>`, `<Down>`, `<Left>`, `<Right>` | |
+| Navigation | `<Home>`, `<End>`, `<PageUp>`, `<PageDown>`, `<Insert>` | |
+| Function keys | `<F1>` through `<F24>` | |
+
+Modifiers are `C-` for control, `M-` for alt and `S-` for shift,
+written in that order when a key carries more than one: `<C-M-x>`.
+`Ctrl-`, `Alt-`, `A-` and `Shift-` are read on the way in and never
+printed.
+
+Terminals disagree with each other about three keys, so maki settles
+each one way:
+
+- Control plus a letter is lowercase, so `<C-N>` is `<C-n>`. Vim has
+  the same rule, and crossterm gives maki the real case to apply it to.
+- Shift plus a letter is the uppercase letter, so `<S-a>` is `A`. Shift
+  plus a digit or a punctuation mark keeps its prefix: `<S-1>`.
+- Shift+Tab is `<S-Tab>` whether or not the terminal speaks the kitty
+  keyboard protocol.
+
+Write the notation itself; there is nothing to import. A key spelling
+in a plugin's source is checked when the plugin loads, and one that is
+wrong is reported on screen naming the file and line, so a typo is a
+message at startup rather than a binding that quietly never fires.
+
+```lua
+if ev.type == "key" and ev.key == "<CR>" then submit() end
+```
+
+Earlier versions of maki delivered a `win:recv` key event as `"enter"`,
+`"esc"`, `"ctrl+n"` or `"shift+tab"`. The same presses now arrive as
+`<CR>`, `<Esc>`, `<C-n>` and `<S-Tab>`. That check reports the old
+spellings by name, so a plugin written against them says so at startup
+instead of going quiet.
+
 ---
 
 ### `maki.keymap.set()` {#maki-keymap-set}
@@ -3320,6 +3373,30 @@ exists for that key.
 
 ```lua
 maki.keymap.del("n", "<C-t>")
+```
+
+---
+
+### `maki.keymap.normalize()` {#maki-keymap-normalize}
+
+```lua
+maki.keymap.normalize({lhs})
+```
+
+Canonical spelling of {lhs}, so no plugin has to know which of
+`<CR>`/`<Enter>`/`<Return>` maki prints. Every spelling `set` accepts is
+accepted here, and the answer is the string a `key` event carries.
+
+**Parameters:**
+
+- `{lhs}` (`string`) Key in any accepted notation.
+
+**Returns:** (`string|nil`, `string|nil`) Canonical notation, or nil and an error.
+
+**Example:**
+
+```lua
+local canon = maki.keymap.normalize("<Enter>")  -- "<CR>"
 ```
 
 
@@ -5629,8 +5706,8 @@ and close the window when you are done.
   - `split` (`string`) dock the window to an edge instead of floating. One of "above", "below", "left", "right", "panel", or "" (floating, default).
   - `order` (`integer`) paint order among split windows at the same edge. Default 50.
   - `focus` (`boolean`) whether the window takes keyboard focus on open. Default true.
-  - `keys` (`table`) key notation this window takes while it is on screen, e.g. `{ "<Tab>", "<CR>" }`. For an unfocused window only, since a focused one is handed every key already, and passing both is an error. A claimed key goes to this window's `recv` and is consumed there, so the chat input under it and any `maki.keymap.set` binding never see it. The claims last exactly as long as the window, so there is nothing to release, and `<C-c>` and `<C-z>` are refused here the way they are in `maki.keymap.set`. The window has to be on screen to take a key: one that is hidden, or sized to nothing, claims nothing. The host's own overlays are answered first, so a picker or the slash command palette opened over the window holds the keys until it closes, and unloading the plugin closes the window and the claims with it. `<S-Tab>` cannot be claimed: it parses as Shift+Tab while terminals deliver BackTab, so the claim would never fire.
-  - `visible` (`boolean`) whether the window is initially visible. Default true.
+  - `keys` (`table`) keys this window takes while it is on screen, e.g. `{ "<Tab>", "<CR>" }`, written in the notation `maki.keymap` documents. For an unfocused window only, since a focused one is handed every key already, and passing both is an error. A claimed key goes to this window's `recv` and is consumed there, so the chat input under it and any `maki.keymap.set` binding never see it. The claims last exactly as long as the window, so there is nothing to release, and `<C-c>` and `<C-z>` are refused here the way they are in `maki.keymap.set`. The window has to be on screen to take a key: one that is hidden, whatever kind it is, or sized to nothing, claims nothing. The host's own overlays are answered first, so a picker or the slash command palette opened over the window holds the keys until it closes, and unloading the plugin closes the window and the claims with it.
+  - `visible` (`boolean`) whether the window is initially visible. Default true. A hidden window of any kind is out of the layout: it reserves no cells, paints nothing and claims no keys. It still receives commands and still reports its events.
   - `needs_input` (`boolean`) whether the window means the session needs user input. Default false.
   - `stack` (`boolean`) offset the window past the other stacked windows sharing its anchor, in open order, with a one row gap. Closing one moves the rest up. Floating windows only. Default false.
 
@@ -5828,7 +5905,7 @@ Win:recv({timeout_ms?})
 Waits for the next event from this window. Call this in a loop to build an interactive UI. Returns nil once the window is closed or the channel disconnects. Pass {timeout_ms} to also get `{type="timeout"}` events so your plugin can animate while idle.
 
 Event tables by type:
-- `{type="key", key}` -- keypress. Key is a string like "q", "j", or "esc".
+- `{type="key", key}` -- keypress. {key} is the key's canonical notation, the one spelling `maki.keymap` documents: `"q"`, `"<CR>"`, `"<Esc>"`, `"<C-n>"`, `"<S-Tab>"`. Compare against Notation, so it is the spelling `maki.keymap.set` takes.
 - `{type="resize", width, height}` -- terminal was resized.
 - `{type="paste", text}` -- bracketed paste.
 - `{type="close"}` -- window was closed externally.
@@ -5846,7 +5923,7 @@ Event tables by type:
 while true do
   local ev = win:recv()
   if not ev or ev.key == "q" then break end
-  if ev.type == "key" and ev.key == "j" then
+  if ev.type == "key" and ev.key == "<Down>" then
     -- move cursor down
   end
 end
@@ -5973,6 +6050,11 @@ Win:hide()
 
 Hides the window without closing it. The window keeps its state
 and buffer contents. Call `show()` to bring it back.
+
+A hidden window is out of the layout, whatever kind it is: a float, a
+split and a panel all reserve no cells, paint nothing and claim no keys
+while they are hidden. The window still receives commands and still
+reports its events, so a plugin can keep working on one nobody can see.
 
 **Example:**
 
@@ -6443,7 +6525,7 @@ function ListPicker.render_header(win, lines, input, prefix, inner)
 --
 -- {opts}:
 --   title, footer, cursor (initial index)
---   submit_keys: extra submit keys besides enter
+--   submit_keys: extra submit keys besides <CR>
 --   action_keys: keys that close the picker and report themselves, like { "R" }
 --     for a refresh binding. Use uppercase keys, lowercase ones keep feeding
 --     the filter
@@ -6455,6 +6537,10 @@ function ListPicker.render_header(win, lines, input, prefix, inner)
 --   key: function(item) -> string|nil, a row's identity. Rows sharing the
 --     selected row's key are tinted, and the cursor follows its key across a
 --     live swap
+--
+-- Caller-supplied keys run through `maki.keymap.normalize` here, so
+-- `{ "<Enter>" }` and `{ "<CR>" }` are the same binding, and a key maki cannot
+-- name is warned about and dropped rather than silently never matching.
 --
 -- Returns { type = "choice"|"delete", index, item },
 -- { type = "key", key, index?, item? } or { type = "close" }. Prefer {item},
@@ -6571,10 +6657,14 @@ function M.report()
 --   * No line ever contains a literal newline; newlines split into rows.
 --
 -- Parents OWN their keys. `handle_key` returns one of R.IGNORED / R.MOVED /
--- R.CHANGED. Parent dispatchers must filter their own keys (esc, ctrl+c,
+-- R.CHANGED. Parent dispatchers must filter their own keys (`<Esc>`, `<C-c>`,
 -- submit keys, etc.) BEFORE forwarding, because `handle_key` claims any key
--- it can interpret. `ctrl+a` is bound to move-home; if a parent wants it for
+-- it can interpret. `<C-a>` is bound to move-home; if a parent wants it for
 -- "select all" it must intercept first.
+--
+-- Keys are canonical notation, the spelling `win:recv` delivers. Splitting a
+-- line is `input:split_line()`, a method rather than a pseudo-key, so every
+-- key in KEYMAP is one a terminal can actually send.
 --
 -- IGNORED is returned when the buffer literally cannot act (backspace at
 -- (1, 0), right at end of buffer, etc.). Parents can use that signal to fall

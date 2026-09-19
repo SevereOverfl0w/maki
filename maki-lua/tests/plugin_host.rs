@@ -16,7 +16,7 @@ use maki_config::{
     ToolOutputLines,
 };
 use maki_lua::{
-    InitFiles, MAX_INFLIGHT_TOOLS, PERMISSION_NAME_WARNING, PluginError, PluginHost,
+    InitFiles, KEY_WARNING, MAX_INFLIGHT_TOOLS, PERMISSION_NAME_WARNING, PluginError, PluginHost,
     SKIPPED_PLUGIN_WARNING, SessionEndReason, WARM_TOOL_CAP,
 };
 use maki_providers::Model;
@@ -6706,4 +6706,51 @@ maki.api.register_tool({{
         again.starts_with("exit:"),
         "VM must stay usable, got: {again}"
     );
+}
+
+/// The one key spelling nothing else can check: a comparison inside Lua that
+/// the host never parses. Every other spelling a plugin writes goes through
+/// `Key::parse` and fails on the spot, so this is the whole reason the source
+/// is read at all, and it has to survive the trip through a real load.
+// The `legacy_spelling` case goes with `key_lint::legacy`, which is
+// temporary; `misspelling` is the half that stays.
+#[test_case::test_case(
+    r#"local function on_key(ev) return ev.key == "ctrl+n" end
+return on_key"#,
+    "<C-n>" ;
+    "legacy_spelling"
+)]
+#[test_case::test_case(
+    r#"local function on_key(ev) return ev.key == "<Escc>" end
+return on_key"#,
+    "<Esc>" ;
+    "misspelling"
+)]
+fn a_wrong_key_spelling_in_plugin_source_is_reported(source: &str, expected: &str) {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source("keys_plugin", source).unwrap();
+
+    let warnings = host.take_key_warnings();
+
+    let warning = warnings
+        .iter()
+        .find(|w| w.contains(KEY_WARNING))
+        .unwrap_or_else(|| panic!("no key warning in {warnings:?}"));
+    assert!(warning.contains(expected), "{warning}");
+    assert!(
+        host.take_key_warnings().is_empty(),
+        "taking has to empty, or a later reload reports this load's findings again"
+    );
+}
+
+/// The bundled plugins are the lint's own corpus: every key they name is
+/// written as a literal now, so a finding here is either a real mistake or a
+/// rule that fires on ordinary code, and both need to fail a run.
+#[test]
+fn the_bundled_plugins_have_no_wrong_key_spellings() {
+    let host = PluginHost::with_all_builtins(fresh_registry()).unwrap();
+
+    let warnings = host.take_key_warnings();
+
+    assert!(warnings.is_empty(), "{warnings:?}");
 }

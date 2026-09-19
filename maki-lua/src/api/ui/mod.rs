@@ -3,14 +3,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyModifiers};
 use humantime::format_duration;
 use maki_highlight::{DEFAULT_COLOR_NAME, SegmentColor};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
 use strum::VariantNames;
 
-use crate::api::keymap::{parse_key_notation, reject_reserved};
+use crate::api::keymap::accept_key;
 use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, InputEdit,
     InputRequest, Split, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_send,
@@ -18,6 +17,7 @@ use crate::api::util::command::{
 use crate::api::util::convert::opt_bool;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::docs::{FnDoc, ParamDoc};
+use crate::key::Key;
 pub(crate) mod blit;
 pub(crate) mod buf;
 pub(crate) mod win;
@@ -560,12 +560,12 @@ async fn open_editor(
     Ok(reply_rx.recv_async().await.unwrap_or(-1))
 }
 
-/// The keys an unfocused window takes while it is on screen, parsed with the
-/// notation parser `maki.keymap.set` uses so the two can never drift.
+/// The keys an unfocused window takes while it is on screen, read through the
+/// same gate `maki.keymap.set` reads, so the two can never drift.
 ///
 /// Every key is parsed before the window is opened, so a typo leaves the
 /// plugin with no window rather than a window holding half a list.
-fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<(KeyCode, KeyModifiers)>> {
+fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<Key>> {
     let Some(keys) = opts.get::<Option<Table>>("keys")? else {
         return Ok(Vec::new());
     };
@@ -573,12 +573,7 @@ fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<(KeyCode, KeyM
         return Err(mlua::Error::runtime(FOCUSED_CLAIM_ERR));
     }
     keys.sequence_values::<String>()
-        .map(|lhs| {
-            let lhs = lhs?;
-            let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
-            reject_reserved(&lhs, key, modifiers)?;
-            Ok((key, modifiers))
-        })
+        .map(|lhs| accept_key(&lhs?))
         .collect()
 }
 
@@ -604,8 +599,8 @@ fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<(KeyCode, KeyM
 ///   - split (string): dock the window to an edge instead of floating. One of "above", "below", "left", "right", "panel", or "" (floating, default).
 ///   - order (integer): paint order among split windows at the same edge. Default 50.
 ///   - focus (boolean): whether the window takes keyboard focus on open. Default true.
-///   - keys (table): key notation this window takes while it is on screen, e.g. `{ "<Tab>", "<CR>" }`. For an unfocused window only, since a focused one is handed every key already, and passing both is an error. A claimed key goes to this window's `recv` and is consumed there, so the chat input under it and any `maki.keymap.set` binding never see it. The claims last exactly as long as the window, so there is nothing to release, and `<C-c>` and `<C-z>` are refused here the way they are in `maki.keymap.set`. The window has to be on screen to take a key: one that is hidden, or sized to nothing, claims nothing. The host's own overlays are answered first, so a picker or the slash command palette opened over the window holds the keys until it closes, and unloading the plugin closes the window and the claims with it. `<S-Tab>` cannot be claimed: it parses as Shift+Tab while terminals deliver BackTab, so the claim would never fire.
-///   - visible (boolean): whether the window is initially visible. Default true.
+///   - keys (table): keys this window takes while it is on screen, e.g. `{ "<Tab>", "<CR>" }`, written in the notation `maki.keymap` documents. For an unfocused window only, since a focused one is handed every key already, and passing both is an error. A claimed key goes to this window's `recv` and is consumed there, so the chat input under it and any `maki.keymap.set` binding never see it. The claims last exactly as long as the window, so there is nothing to release, and `<C-c>` and `<C-z>` are refused here the way they are in `maki.keymap.set`. The window has to be on screen to take a key: one that is hidden, whatever kind it is, or sized to nothing, claims nothing. The host's own overlays are answered first, so a picker or the slash command palette opened over the window holds the keys until it closes, and unloading the plugin closes the window and the claims with it.
+///   - visible (boolean): whether the window is initially visible. Default true. A hidden window of any kind is out of the layout: it reserves no cells, paints nothing and claims no keys. It still receives commands and still reports its events.
 ///   - needs_input (boolean): whether the window means the session needs user input. Default false.
 ///   - stack (boolean): offset the window past the other stacked windows sharing its anchor, in open order, with a one row gap. Closing one moves the rest up. Floating windows only. Default false.
 /// @return (Win) Window handle.
@@ -1056,10 +1051,7 @@ mod tests {
 
         assert_eq!(
             parse_claimed_keys(&opts, false).unwrap(),
-            vec![
-                (KeyCode::Tab, KeyModifiers::NONE),
-                (KeyCode::Char('n'), KeyModifiers::CONTROL),
-            ]
+            vec![Key::parse("<Tab>").unwrap(), Key::parse("<C-n>").unwrap()]
         );
     }
 
@@ -1069,6 +1061,30 @@ mod tests {
         let opts = lua.create_table().unwrap();
 
         assert!(parse_claimed_keys(&opts, true).unwrap().is_empty());
+    }
+
+    /// A key a plugin can bind is a key a window can claim, and a key it
+    /// cannot bind is one no window can claim either. Two lists that drift
+    /// leave an author guessing which half of the API their key belongs to.
+    #[test_case("<CR>" ; "canonical_name")]
+    #[test_case("<Enter>" ; "alias")]
+    #[test_case("<S-Tab>" ; "shift_tab")]
+    #[test_case("<C-n>" ; "ctrl_letter")]
+    #[test_case("a" ; "plain_char")]
+    #[test_case("<F13>" ; "high_function_key")]
+    #[test_case("<C-c>" ; "reserved_quit")]
+    #[test_case("<C-z>" ; "reserved_suspend")]
+    #[test_case("<nope>" ; "unknown_name")]
+    #[test_case("abc" ; "a_word")]
+    fn a_window_claims_exactly_what_a_keymap_binds(lhs: &str) {
+        let lua = Lua::new();
+        let opts = claim_opts(&lua, &[lhs]);
+
+        assert_eq!(
+            parse_claimed_keys(&opts, false).is_ok(),
+            accept_key(lhs).is_ok(),
+            "{lhs} has to be accepted, or refused, by both"
+        );
     }
 
     /// The same two keys `maki.keymap.set` refuses, from the same list. A
