@@ -10,6 +10,7 @@ use maki_agent::SessionEndReason;
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
+use maki_providers::plugin::DeclAuthority;
 
 use crate::api::keymap::KeymapReader;
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
@@ -159,11 +160,16 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         name: "list",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/list"),
     },
-    // Registers no tool: it declares the `synthetic` provider on the same
-    // authoring surface a third-party plugin uses, claiming the built-in slug.
+    // The last two register no tool. They declare a provider maki ships, on
+    // the same surface a third-party plugin declares one with, which is what
+    // keeps that surface honest.
     BundledPlugin {
         name: "synthetic",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/synthetic"),
+    },
+    BundledPlugin {
+        name: "deepseek",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/deepseek"),
     },
 ];
 
@@ -485,6 +491,9 @@ impl PluginHost {
                 vec![LoadChunk::new(name.as_ref(), init)],
                 LoadContext {
                     opts,
+                    // The one load that ships inside the binary, and so the
+                    // one that may declare a provider under a built-in slug.
+                    authority: DeclAuthority::Bundled,
                     ..LoadContext::plain(None, permissions)
                 },
             )?;
@@ -666,6 +675,7 @@ impl PluginHost {
                     opts,
                     revision_guard: package.revision_guard.clone(),
                     package: true,
+                    authority: DeclAuthority::ThirdParty,
                 },
                 reply: reply_tx,
             })
@@ -742,6 +752,7 @@ impl PluginHost {
                 opts,
                 revision_guard,
                 package: true,
+                authority: DeclAuthority::ThirdParty,
             },
         )
     }

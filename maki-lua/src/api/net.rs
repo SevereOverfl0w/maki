@@ -7,7 +7,7 @@ use arc_swap::ArcSwap;
 use futures_lite::io::AsyncReadExt;
 use isahc::config::{Configurable, RedirectPolicy, ResolveMap, VersionNegotiation};
 use isahc::{AsyncBody, HttpClient, Request, Response};
-use maki_config::host_allowed;
+
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
 use smol::{Timer, unblock};
@@ -15,7 +15,7 @@ use url::Url;
 
 use crate::api::util::pair::{Pair, try_pair};
 
-use crate::plugin_permissions::{NetHosts, PluginPermissions};
+use crate::plugin_permissions::{NetEgress, PluginPermissions};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 120;
@@ -197,9 +197,9 @@ struct RequestParams {
     retries: u32,
     /// `None` when the guard reached its verdict without DNS.
     pin: Option<DnsPin>,
-    /// Carried rather than passed, so every hop is vetted against the list the
-    /// first one was.
-    declared: NetHosts,
+    /// Carried rather than passed, so every hop is vetted against the same
+    /// reach the first one was.
+    egress: NetEgress,
 }
 
 struct ResponseData {
@@ -237,11 +237,11 @@ struct ResponseData {
 #[lua_fn(guard = Net)]
 async fn request(
     lua: Lua,
-    #[ctx] hosts: NetHosts,
+    #[ctx] egress: NetEgress,
     url: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
-    let params = try_pair!(extract_request_params(&url, hosts, opts.as_ref()).await);
+    let params = try_pair!(extract_request_params(&url, egress, opts.as_ref()).await);
     let resp = try_pair!(do_request(params).await);
     let tbl = lua.create_table()?;
     tbl.set("body", resp.body)?;
@@ -261,22 +261,17 @@ lua_table! {
     /// local res, err = maki.net.request("https://example.com")
     /// if res then print(res.body) end
     /// ```
-    "maki.net" => pub(crate) fn create_net_table(perms: &PluginPermissions, hosts: NetHosts), DOCS [
-        request(perms, hosts),
+    "maki.net" => pub(crate) fn create_net_table(perms: &PluginPermissions, egress: NetEgress), DOCS [
+        request(perms, egress),
     ]
 }
 
-/// The plugin's own egress allowlist, checked once the SSRF guard has settled
-/// what the URL really points at.
-///
-/// A plugin that declared no `net_hosts` is unrestricted, which is what every
-/// plugin written before the list existed relies on.
-fn check_declared_host(url: &str, hosts: Option<&[String]>) -> Result<(), String> {
-    let Some(hosts) = hosts else {
-        return Ok(());
-    };
+/// The plugin's own reach, checked once the SSRF guard has settled what the
+/// URL really points at. See [`NetEgress`] for what a plugin may reach and
+/// why the manifest is not the whole of it.
+fn check_declared_host(url: &str, egress: &NetEgress) -> Result<(), String> {
     let (host, _) = extract_host_port(url).ok_or("cannot extract host from URL")?;
-    if host_allowed(host, hosts) {
+    if egress.allows(host) {
         return Ok(());
     }
     Err(format!(
@@ -291,21 +286,21 @@ fn check_declared_host(url: &str, hosts: Option<&[String]>) -> Result<(), String
 async fn vet(
     url: &str,
     allowed: &HostAllowlist,
-    declared: Option<&[String]>,
+    egress: &NetEgress,
 ) -> Result<(String, Option<DnsPin>), String> {
     let url = validate_and_upgrade_url(url, allowed)?;
     let pin = check_ssrf(&url, allowed).await?;
-    check_declared_host(&url, declared)?;
+    check_declared_host(&url, egress)?;
     Ok((url, pin))
 }
 
 async fn extract_request_params(
     url: &str,
-    hosts: NetHosts,
+    egress: NetEgress,
     opts: Option<&Table>,
 ) -> Result<RequestParams, String> {
     let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
-    let (url, pin) = vet(url, &allowed, hosts.as_deref()).await?;
+    let (url, pin) = vet(url, &allowed, &egress).await?;
 
     let method = opts
         .and_then(|o| o.get::<String>("method").ok())
@@ -350,7 +345,7 @@ async fn extract_request_params(
         max_bytes,
         retries,
         pin,
-        declared: hosts,
+        egress,
     })
 }
 
@@ -370,8 +365,17 @@ fn build_request(
         builder = builder.header(k.as_str(), v.as_str());
     }
 
+    // A zero-length body is not the same as no body: isahc announces the known
+    // length, which turns a GET into an upload carrying `content-length: 0`.
+    // None of maki's other clients send that, and a plugin standing in for one
+    // of them has to look the same on the wire.
+    let body = if body.is_empty() {
+        AsyncBody::empty()
+    } else {
+        AsyncBody::from(body)
+    };
     builder
-        .body(AsyncBody::from(body))
+        .body(body)
         .map_err(|e| format!("request build error: {e}"))
 }
 
@@ -542,7 +546,7 @@ impl RequestParams {
         let target = base
             .join(location)
             .map_err(|e| format!("invalid redirect to {location}: {e}"))?;
-        let (target, pin) = vet(target.as_str(), allowed, self.declared.as_deref()).await?;
+        let (target, pin) = vet(target.as_str(), allowed, &self.egress).await?;
 
         let landed =
             Url::parse(&target).map_err(|e| format!("invalid redirect to {location}: {e}"))?;
@@ -779,7 +783,7 @@ mod tests {
     }
 
     fn request_params(url: &str, opts: Option<&Table>) -> Result<RequestParams, String> {
-        smol::block_on(extract_request_params(url, None, opts))
+        smol::block_on(extract_request_params(url, NetEgress::default(), opts))
     }
 
     #[test_case(&[], "https://example.com/", "https://example.com/" ; "https_passthrough")]
@@ -866,7 +870,7 @@ mod tests {
             max_bytes: DEFAULT_MAX_BYTES,
             retries: 0,
             pin: None,
-            declared: None,
+            egress: NetEgress::default(),
         }
     }
 
@@ -1082,7 +1086,8 @@ mod tests {
     #[test_case(r#"net.request("ftp://x")"# ; "invalid_url")]
     fn lua_request_error_returns_nil_and_message(expr: &str) {
         let lua = Lua::new();
-        let net = create_net_table(&lua, &PluginPermissions::trusted(), None).unwrap();
+        let net =
+            create_net_table(&lua, &PluginPermissions::trusted(), NetEgress::default()).unwrap();
         lua.globals().set("net", net).unwrap();
         let (is_nil, has_err): (bool, bool) = lua
             .load(format!(
@@ -1094,8 +1099,8 @@ mod tests {
         assert!(has_err);
     }
 
-    fn declared(hosts: Option<&[&str]>) -> NetHosts {
-        hosts.map(|hosts| hosts.iter().map(|host| (*host).to_owned()).collect())
+    fn declared(hosts: Option<&[&str]>) -> NetEgress {
+        NetEgress::new(hosts.map(|hosts| hosts.iter().map(|host| (*host).to_owned()).collect()))
     }
 
     /// The gate sits in `extract_request_params`, so these go through it

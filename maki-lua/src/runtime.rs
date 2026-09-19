@@ -33,10 +33,10 @@ use serde_json::Value;
 use strum::{EnumString, IntoStaticStr};
 
 use maki_config::RawConfig;
+use maki_providers::plugin::DeclAuthority;
 use maki_storage::id::{MakiId, SessionRef};
 
 use crate::api::autocmd::AutocmdStore;
-use crate::api::create_maki_global;
 use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeymapStore, KeymapWriter};
@@ -62,6 +62,7 @@ use crate::api::util::command::{
 use crate::api::util::convert::{json_to_lua, lua_to_json_within};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
 use crate::api::util::setup::ConfigStore;
+use crate::api::{Owner, create_maki_global};
 use crate::docs_render;
 use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
@@ -189,8 +190,9 @@ impl LoadChunk {
 /// Everything a load needs besides the code itself.
 ///
 /// One value rather than a row of positional arguments: it travels unchanged
-/// from the caller through the request channel into the runtime, and the two
-/// package-only fields would otherwise be `None, false` at every other site.
+/// from the caller through the request channel into the runtime, and the
+/// fields only a package cares about would otherwise be spelled out, at their
+/// boring default, by every other caller.
 pub struct LoadContext {
     pub plugin_dir: Option<PathBuf>,
     pub permissions: PluginPermissions,
@@ -202,6 +204,12 @@ pub struct LoadContext {
     /// Whether this owner is a package, which is what `pack.get` reports as
     /// active.
     pub package: bool,
+    /// Whether the code being loaded ships inside the binary, which is what
+    /// lets it declare a provider under a built-in slug. Everything else is
+    /// third party however the user installed it, so every path but
+    /// [`PluginHost::load_builtins`] leaves this at the answer that grants
+    /// nothing.
+    pub authority: DeclAuthority,
 }
 
 impl LoadContext {
@@ -214,6 +222,7 @@ impl LoadContext {
             opts: PluginOpts::default(),
             revision_guard: None,
             package: false,
+            authority: DeclAuthority::ThirdParty,
         }
     }
 }
@@ -2435,6 +2444,7 @@ impl LuaRuntime {
             opts,
             revision_guard,
             package,
+            authority,
         } = context;
         let map_err = |e: mlua::Error| PluginError::Lua {
             plugin: name.to_string(),
@@ -2461,7 +2471,10 @@ impl LuaRuntime {
             &self.lua,
             Arc::clone(&self.pending),
             Arc::clone(&pending_rules),
-            Arc::clone(&name),
+            Owner {
+                name: Arc::clone(&name),
+                authority,
+            },
             self.ui_action_tx.clone(),
             &permissions,
             Arc::clone(&opts),
