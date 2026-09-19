@@ -6,6 +6,7 @@ use arc_swap::ArcSwap;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{AppDataRefMut, Lua, RegistryKey, Result as LuaResult, Table};
 
+use crate::api::util::convert::opt_bool;
 use crate::api::util::pair::{Pair, pair};
 use crate::key::Key;
 
@@ -13,6 +14,7 @@ static NEXT_KEYMAP_ID: AtomicU64 = AtomicU64::new(1);
 
 const NO_STORE_ERR: &str = "keymap store not initialized";
 const RESERVED_KEY_ERR: &str = "is reserved by the host and would never reach this binding";
+const TAKEN_ERR: &str = "is already mapped by";
 
 /// Keystrokes one plugin may have in flight before its bindings stop taking
 /// keys. Each plugin is counted on its own, so one that parks in a callback
@@ -203,6 +205,23 @@ impl Default for PluginDispatch {
     }
 }
 
+/// What a `set` did, and the one thing the caller has to do about it.
+pub(crate) enum SetOutcome {
+    /// Nothing else held the key.
+    Free,
+    /// Another owner held it. Its binding is underneath and comes back when
+    /// this one is removed, so this is a warning naming both.
+    Shadowed(Arc<str>),
+    /// `unique` was asked for and the named owner already holds the key.
+    /// Nothing was stored.
+    Taken(Arc<str>),
+    /// The load that called this is gone. Nothing was stored.
+    Stale,
+}
+
+/// Global bindings, newest first, and that is the only ordering in this file:
+/// [`Self::set`] inserts at the front, [`Self::snapshot_entries`] maps in
+/// order, and [`KeymapReader::dispatch`] takes the first match.
 pub(crate) struct KeymapStore {
     globals: Vec<StoredKeymap>,
     plugins: HashMap<Arc<str>, PluginDispatch>,
@@ -226,24 +245,76 @@ impl KeymapStore {
         self.plugins.entry(Arc::clone(plugin)).or_default().clone()
     }
 
-    /// Whether a global binding was replaced.
-    pub fn set(&mut self, key: Key, callback: RegistryKey, plugin: Arc<str>, desc: String) -> bool {
+    /// Puts {plugin}'s binding for {key} on top of whatever else holds it.
+    ///
+    /// Bindings stack per owner: the caller's own entry for the key is
+    /// replaced, everyone else's is shadowed and comes back when this one goes
+    /// away. A plugin cannot hold another plugin's `RegistryKey`, so the
+    /// save-and-restore vim leaves to `maparg()` has to be automatic here.
+    ///
+    /// With {unique}, any existing binding for the key fails the call,
+    /// including the caller's own, which is what `:map <unique>` means. A
+    /// reload cannot trip on that because [`Self::revive`] clears the old
+    /// load's entries first.
+    ///
+    /// A `set` from a load that is gone stores nothing. Such a straggler used
+    /// to publish a binding that could never fire; on a stack it would also
+    /// sit on top of a live binding from another plugin and make that key fall
+    /// through until the next reload.
+    pub fn set(
+        &mut self,
+        key: Key,
+        callback: RegistryKey,
+        plugin: Arc<str>,
+        desc: String,
+        unique: bool,
+    ) -> SetOutcome {
         let state = self.plugin_state(&plugin);
-        let replaced = self.globals.iter().any(|b| b.key == key);
-        self.globals.retain(|b| b.key != key);
-        self.globals.push(StoredKeymap {
-            id: NEXT_KEYMAP_ID.fetch_add(1, Ordering::Relaxed),
-            key,
-            callback: Arc::new(callback),
-            plugin,
-            desc,
-            state,
-        });
-        replaced
+        if !state.live.load(Ordering::Acquire) {
+            return SetOutcome::Stale;
+        }
+        if unique && let Some(owner) = self.owner_of(key) {
+            return SetOutcome::Taken(owner);
+        }
+        self.globals.retain(|b| b.key != key || b.plugin != plugin);
+        let shadowed = self.owner_of(key);
+        self.globals.insert(
+            0,
+            StoredKeymap {
+                id: NEXT_KEYMAP_ID.fetch_add(1, Ordering::Relaxed),
+                key,
+                callback: Arc::new(callback),
+                plugin,
+                desc,
+                state,
+            },
+        );
+        shadowed.map_or(SetOutcome::Free, SetOutcome::Shadowed)
     }
 
-    pub fn del(&mut self, key: Key) {
-        self.globals.retain(|b| b.key != key);
+    /// Removes {plugin}'s binding for {key}, uncovering whatever it shadowed.
+    ///
+    /// Answers with the owner still holding the key when the caller had no
+    /// binding of its own: that is a `del` aimed at somebody else's mapping,
+    /// which changes nothing and is worth a warning.
+    pub fn del(&mut self, key: Key, plugin: &str) -> Option<Arc<str>> {
+        let mine = self
+            .globals
+            .iter()
+            .position(|b| b.key == key && b.plugin.as_ref() == plugin);
+        if let Some(idx) = mine {
+            self.globals.remove(idx);
+            return None;
+        }
+        self.owner_of(key)
+    }
+
+    /// The plugin whose binding for {key} would fire, which is the newest one.
+    fn owner_of(&self, key: Key) -> Option<Arc<str>> {
+        self.globals
+            .iter()
+            .find(|b| b.key == key)
+            .map(|b| Arc::clone(&b.plugin))
     }
 
     /// The load is marked dead as well as emptied of keys. The snapshot loses
@@ -275,8 +346,9 @@ impl KeymapStore {
         self.plugins.remove(plugin);
     }
 
-    /// Every global binding, in dispatch order, which is also the order the
-    /// keymap listing and the help modal read them in.
+    /// Every global binding, newest first, which is dispatch order and the
+    /// order a keymap listing reads them in: the first entry per key is the
+    /// one that fires.
     pub fn snapshot_entries(&self) -> Vec<KeymapEntry> {
         self.globals
             .iter()
@@ -333,8 +405,13 @@ fn store_mut(lua: &Lua) -> LuaResult<AppDataRefMut<'_, KeymapStore>> {
 }
 
 /// Bind a key to a Lua function, just like `vim.keymap.set`. Only
-/// normal mode (`"n"`) is supported right now. If {lhs} is already
-/// mapped, the old binding is replaced and a warning is logged.
+/// normal mode (`"n"`) is supported right now.
+///
+/// The binding belongs to the plugin that set it, and bindings stack: the
+/// last `set` wins, and `del` or unloading that plugin gives the key back to
+/// whoever held it before. Shadowing another plugin's binding is a warning
+/// naming both. Setting a key you already hold replaces your own binding
+/// rather than stacking on it.
 ///
 /// The binding is global and lasts until `del` or the plugin unloads. For a
 /// key a popup should own only while it is on screen, declare it in the
@@ -344,8 +421,11 @@ fn store_mut(lua: &Lua) -> LuaResult<AppDataRefMut<'_, KeymapStore>> {
 /// A handler that runs owns the key. Its return value is not read, and a
 /// handler that raises is logged with the key spent all the same: a keystroke
 /// replayed once the UI has moved on lands somewhere the user never aimed it.
-/// The key reaches the binding underneath only when the host could not
-/// dispatch it at all, which it settles before any of your Lua runs.
+///
+/// A binding that cannot claim the key, because its plugin has too many
+/// callbacks in flight, falls through to the host's own binding rather than
+/// to the binding it shadows. The user aimed at the top one, and the host is
+/// the honest fallback.
 ///
 /// `<C-c>` and `<C-z>` are the two keys no binding takes: quitting and
 /// suspending have to work whatever a plugin is doing. Binding one is an
@@ -356,6 +436,8 @@ fn store_mut(lua: &Lua) -> LuaResult<AppDataRefMut<'_, KeymapStore>> {
 /// @param rhs function Called when the key is pressed. Its return value is not read.
 /// @param opts table? Options:
 ///   `desc` (string) short description shown in the keymap list.
+///   `unique` (boolean) fail the call, naming the owner, when anything already
+///   maps the key. Default false.
 /// @example
 /// maki.keymap.set("n", "<C-t>", function()
 ///   print("toggle!")
@@ -379,17 +461,31 @@ fn set(
         .as_ref()
         .and_then(|o| o.get::<String>("desc").ok())
         .unwrap_or_default();
+    let unique = opts
+        .as_ref()
+        .and_then(|o| opt_bool(o, "unique"))
+        .unwrap_or(false);
     let registry_key = lua.create_registry_value(rhs)?;
-    let shadowed = store_mut(lua)?.set(key, registry_key, Arc::clone(&plugin), desc);
-    if shadowed {
-        tracing::warn!(key = %lhs, plugin = %plugin, "keymap shadowed by plugin");
+    let outcome = store_mut(lua)?.set(key, registry_key, Arc::clone(&plugin), desc, unique);
+    match outcome {
+        SetOutcome::Free => {}
+        SetOutcome::Shadowed(owner) => {
+            tracing::warn!(key = %lhs, plugin = %plugin, shadowed = %owner, "keymap shadowed by plugin");
+        }
+        SetOutcome::Taken(owner) => {
+            return Err(mlua::Error::runtime(format!("{lhs} {TAKEN_ERR} {owner}")));
+        }
+        SetOutcome::Stale => {
+            tracing::debug!(key = %lhs, plugin = %plugin, "keymap dropped: plugin unloaded");
+        }
     }
     publish_keymap_snapshot(lua);
     Ok(())
 }
 
-/// Remove the mapping for {lhs} in {mode}. Does nothing if no mapping
-/// exists for that key.
+/// Remove your plugin's mapping for {lhs} in {mode}, which gives the key back
+/// to whichever plugin held it before you. Does nothing if you have no
+/// mapping for that key, and warns when another plugin holds it.
 ///
 /// @param mode string Mode letter (reserved for future modes).
 /// @param lhs string Key to unmap, in Vim notation.
@@ -397,10 +493,12 @@ fn set(
 /// maki.keymap.del("n", "<C-t>")
 #[lua_fn]
 fn del(lua: &Lua, #[ctx] plugin: Arc<str>, mode: String, lhs: String) -> LuaResult<()> {
-    let _ = (mode, &plugin);
+    let _ = mode;
     let key = Key::parse(&lhs).map_err(mlua::Error::runtime)?;
-    if let Some(mut store) = lua.app_data_mut::<KeymapStore>() {
-        store.del(key);
+    if let Some(mut store) = lua.app_data_mut::<KeymapStore>()
+        && let Some(owner) = store.del(key, &plugin)
+    {
+        tracing::warn!(key = %lhs, plugin = %plugin, owner = %owner, "keymap del left another plugin's binding alone");
     }
     publish_keymap_snapshot(lua);
     Ok(())
@@ -505,10 +603,20 @@ mod tests {
         Key::parse(lhs).unwrap()
     }
 
-    fn global(store: &mut KeymapStore, lua: &Lua, lhs: &str, plugin: &str) {
+    fn global(store: &mut KeymapStore, lua: &Lua, lhs: &str, plugin: &str) -> SetOutcome {
+        bind(store, lua, lhs, plugin, false)
+    }
+
+    fn bind(
+        store: &mut KeymapStore,
+        lua: &Lua,
+        lhs: &str,
+        plugin: &str,
+        unique: bool,
+    ) -> SetOutcome {
         let f = lua.create_function(|_, ()| Ok(())).unwrap();
         let k = lua.create_registry_value(f).unwrap();
-        store.set(parsed(lhs), k, Arc::from(plugin), String::new());
+        store.set(parsed(lhs), k, Arc::from(plugin), String::new(), unique)
     }
 
     fn published(store: &KeymapStore) -> KeymapReader {
@@ -517,14 +625,74 @@ mod tests {
         reader
     }
 
+    /// Which plugin's binding for {lhs} fires.
+    fn dispatching_owner(store: &KeymapStore, lhs: &str) -> Option<Arc<str>> {
+        let mut owner = None;
+        published(store).dispatch(parsed(lhs), |ticket| {
+            owner = Some(Arc::clone(ticket.plugin()));
+            true
+        });
+        owner
+    }
+
+    /// Two plugins wanting one key is the ordinary case, and the loser has to
+    /// get its key back rather than lose it for the rest of the run.
     #[test]
-    fn keymap_store_set_and_shadow() {
+    fn a_shadowed_binding_comes_back_when_the_one_over_it_goes_away() {
         let lua = Lua::new();
         let mut store = KeymapStore::new();
 
-        global(&mut store, &lua, "t", PLUGIN);
-        global(&mut store, &lua, "t", OTHER_PLUGIN);
+        global(&mut store, &lua, TAB, PLUGIN);
+        global(&mut store, &lua, TAB, OTHER_PLUGIN);
+        assert_eq!(store.globals.len(), 2, "both bindings are kept");
+        assert_eq!(
+            dispatching_owner(&store, TAB).as_deref(),
+            Some(OTHER_PLUGIN),
+            "the newest binding is the one that fires"
+        );
+
+        store.del(parsed(TAB), OTHER_PLUGIN);
+        assert_eq!(
+            dispatching_owner(&store, TAB).as_deref(),
+            Some(PLUGIN),
+            "removing it uncovers the binding underneath"
+        );
+
+        global(&mut store, &lua, TAB, OTHER_PLUGIN);
+        store.clear_plugin(OTHER_PLUGIN);
+        assert_eq!(
+            dispatching_owner(&store, TAB).as_deref(),
+            Some(PLUGIN),
+            "unloading the owner uncovers it the same way"
+        );
+    }
+
+    /// Rebinding your own key replaces your entry. Stacking it on yourself
+    /// would grow a pile only a reload could clear.
+    #[test]
+    fn one_owner_setting_the_same_key_twice_keeps_one_entry() {
+        let lua = Lua::new();
+        let mut store = KeymapStore::new();
+
+        global(&mut store, &lua, TAB, PLUGIN);
+        global(&mut store, &lua, TAB, PLUGIN);
         assert_eq!(store.globals.len(), 1);
+    }
+
+    /// `del` is scoped to the caller, so a plugin cannot unbind a key it never
+    /// bound and leave the user with a dead keystroke.
+    #[test]
+    fn del_by_a_non_owner_leaves_the_binding_alone() {
+        let lua = Lua::new();
+        let mut store = KeymapStore::new();
+        global(&mut store, &lua, TAB, PLUGIN);
+
+        assert_eq!(
+            store.del(parsed(TAB), OTHER_PLUGIN).as_deref(),
+            Some(PLUGIN),
+            "the answer names the owner, for the warning"
+        );
+        assert_eq!(dispatching_owner(&store, TAB).as_deref(), Some(PLUGIN));
     }
 
     #[test]
@@ -533,8 +701,27 @@ mod tests {
         let mut store = KeymapStore::new();
 
         global(&mut store, &lua, "x", PLUGIN);
-        store.del(parsed("x"));
+        assert!(store.del(parsed("x"), PLUGIN).is_none());
         assert!(store.globals.is_empty());
+    }
+
+    /// `unique` is how a plugin says the key is no good to it shared. Vim
+    /// fails the same way, and the error has to name who to go and look at.
+    #[test]
+    fn unique_refuses_a_key_anything_already_holds() {
+        let lua = Lua::new();
+        let mut store = KeymapStore::new();
+
+        assert!(matches!(
+            bind(&mut store, &lua, TAB, PLUGIN, true),
+            SetOutcome::Free
+        ));
+        let taken = bind(&mut store, &lua, TAB, OTHER_PLUGIN, true);
+        assert!(
+            matches!(&taken, SetOutcome::Taken(owner) if owner.as_ref() == PLUGIN),
+            "the owner has to be named"
+        );
+        assert_eq!(store.globals.len(), 1, "nothing was stored");
     }
 
     #[test]
@@ -740,6 +927,28 @@ mod tests {
         assert!(
             published(&store).dispatch(parsed(TAB), |_| true),
             "the load that replaced it dispatches"
+        );
+    }
+
+    /// The straggler's `set` stores nothing, which is what keeps a live
+    /// binding from another plugin from being buried under a dead one until
+    /// the next reload.
+    #[test]
+    fn a_straggler_does_not_bury_a_live_binding_under_a_dead_one() {
+        let lua = Lua::new();
+        let mut store = KeymapStore::new();
+        global(&mut store, &lua, TAB, PLUGIN);
+        store.clear_plugin(PLUGIN);
+        global(&mut store, &lua, TAB, OTHER_PLUGIN);
+
+        assert!(matches!(
+            global(&mut store, &lua, TAB, PLUGIN),
+            SetOutcome::Stale
+        ));
+        assert_eq!(
+            dispatching_owner(&store, TAB).as_deref(),
+            Some(OTHER_PLUGIN),
+            "the live binding still fires"
         );
     }
 }

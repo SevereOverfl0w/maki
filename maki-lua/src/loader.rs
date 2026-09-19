@@ -1604,6 +1604,28 @@ mod tests {
         assert!(host.keymap_reader().load().entries.is_empty());
     }
 
+    /// `unique` is a plugin saying the key is no good to it shared, so the
+    /// call has to fail where the author reads it and name who to go look at.
+    #[test]
+    fn a_unique_bind_fails_on_a_key_another_plugin_holds() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("first", r#"maki.keymap.set("n", "<C-g>", function() end)"#)
+            .unwrap();
+
+        let err = host
+            .load_source(
+                "second",
+                r#"maki.keymap.set("n", "<C-g>", function() end, { unique = true })"#,
+            )
+            .expect_err("the key is taken");
+        assert!(err.to_string().contains("first"), "got: {err}");
+        assert_eq!(
+            host.keymap_reader().load().entries.len(),
+            1,
+            "the refused bind stored nothing"
+        );
+    }
+
     /// A handler that raises is logged and its key is spent: handing the key
     /// back seconds later lands it in a UI the user never pressed it against.
     /// What the host owes is that the raise wedges nothing.

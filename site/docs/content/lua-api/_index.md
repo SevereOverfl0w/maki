@@ -3319,8 +3319,13 @@ maki.keymap.set({mode}, {lhs}, {rhs}, {opts?})
 ```
 
 Bind a key to a Lua function, just like `vim.keymap.set`. Only
-normal mode (`"n"`) is supported right now. If {lhs} is already
-mapped, the old binding is replaced and a warning is logged.
+normal mode (`"n"`) is supported right now.
+
+The binding belongs to the plugin that set it, and bindings stack: the
+last `set` wins, and `del` or unloading that plugin gives the key back to
+whoever held it before. Shadowing another plugin's binding is a warning
+naming both. Setting a key you already hold replaces your own binding
+rather than stacking on it.
 
 The binding is global and lasts until `del` or the plugin unloads. For a
 key a popup should own only while it is on screen, declare it in the
@@ -3330,8 +3335,11 @@ and hands it back when the window closes.
 A handler that runs owns the key. Its return value is not read, and a
 handler that raises is logged with the key spent all the same: a keystroke
 replayed once the UI has moved on lands somewhere the user never aimed it.
-The key reaches the binding underneath only when the host could not
-dispatch it at all, which it settles before any of your Lua runs.
+
+A binding that cannot claim the key, because its plugin has too many
+callbacks in flight, falls through to the host's own binding rather than
+to the binding it shadows. The user aimed at the top one, and the host is
+the honest fallback.
 
 `<C-c>` and `<C-z>` are the two keys no binding takes: quitting and
 suspending have to work whatever a plugin is doing. Binding one is an
@@ -3344,6 +3352,10 @@ error rather than a mapping that never fires.
 - `{rhs}` (`function`) Called when the key is pressed. Its return value is not read.
 - `{opts?}` (`table?`) Options:
   - `desc` (`string`) short description shown in the keymap list.
+  - `unique` (`boolean`) fail the call, naming the owner, when anything already
+
+  maps the key. Default false.
+
 
 **Example:**
 
@@ -3361,8 +3373,9 @@ end, { desc = "Toggle panel" })
 maki.keymap.del({mode}, {lhs})
 ```
 
-Remove the mapping for {lhs} in {mode}. Does nothing if no mapping
-exists for that key.
+Remove your plugin's mapping for {lhs} in {mode}, which gives the key back
+to whichever plugin held it before you. Does nothing if you have no
+mapping for that key, and warns when another plugin holds it.
 
 **Parameters:**
 
